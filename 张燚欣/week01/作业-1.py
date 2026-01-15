@@ -1,59 +1,131 @@
-import jieba
 import pandas as pd
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.neighbors import KNeighborsClassifier
-from openai import OpenAI
-from typing import Union
-from fastapi import FastAPI
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertForSequenceClassification
+from sklearn.model_selection import train_test_split
 
+# 加载数据
+df = pd.read_csv('dataset.csv')
 
-app = FastAPI()
+# 准备标签
+label_map = {'正面': 0, '负面': 1}
+df['label_id'] = df['label'].map(label_map)
 
-dataset = pd.read_csv('dataset.csv', sep='\t', header=None, nrows=None)
-input_sentense = dataset[0].apply(lambda x : ' '.join(jieba.lcut(x)))
-
-vector = CountVectorizer()
-input_feature = vector.fit_transform(input_sentense.values) # 对划分后的文本词语进行编号并转换成向量
-
-model = KNeighborsClassifier(n_neighbors=3) # KNN3
-model.fit(input_feature, dataset[1].values)
-
-client = OpenAI(
-    api_key='sk-08a6acbb4a2e46e195b8199036824588',
-
-    base_url='https://dashscope.aliyuncs.com/compatible-mode/v1',
+# 划分数据
+X_train, X_test, y_train, y_test = train_test_split(
+    df['text'], df['label_id'], test_size=0.3, random_state=42
 )
 
-@app.get("/text-cls/ml")
-def text_classify_using_ml(text: str) -> str:
-    """
-    用机器学习进行文本分类
-    """
-    text_feature = vector.transform([' '.join(jieba.lcut(text))])
-    return model.predict(text_feature)[0]
+# 初始化BERT
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
 
-@app.get("/text-cls/llm")
-def text_classify_using_llm(text: str) -> str:
-    """
-    用大模型进行文本分类
-    """
-    completion = client.chat.completions.create(
-        model='qwen-flash',
+# 创建数据集类
+class CommentDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len=64):
+        self.texts = texts.reset_index(drop=True)
+        self.labels = labels.reset_index(drop=True)
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        encoding = self.tokenizer.encode_plus(
+            text,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'label': torch.tensor(self.labels[idx], dtype=torch.long)
+        }
 
-        messages=[
-            {'role': 'system',
-             'content': '你是文本分类助手，需要对我输入的文本进行分类, 只输出类别即可，其他的东西一概不要输出'},
-            {'role': 'user', 'content': f'帮我判断"{text}"这句话是什么类别，类别只能从：'
-                                        'FilmTele-Play, Video-Play, Music-Play, Radio-Listen, Alarm-Update,'
-                                        ' Weather-Query, Travel-Query, HomeAppliance-Control, Calendar-Query, TVProgram-Play, Audio-Play, Other这几个类别中选择'}
-        ]
+# 创建数据加载器
+train_dataset = CommentDataset(X_train, y_train, tokenizer)
+test_dataset = CommentDataset(X_test, y_test, tokenizer)
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=4)
+
+# 初始化模型
+model = BertForSequenceClassification.from_pretrained(
+    'bert-base-chinese',
+    num_labels=2
+).to(device)
+
+# 训练配置
+optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+
+# 训练函数
+def train_epoch(model, data_loader, optimizer):
+    model.train()
+    for batch in data_loader:
+        optimizer.zero_grad()
+        
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['label'].to(device)
+        
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )
+        
+        loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+
+# 评估函数
+def evaluate(model, data_loader):
+    model.eval()
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
+            
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)_, preds = torch.max(outputs.logits, dim=1)
+            
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+    
+    return correct / total
+
+# 训练模型
+print("开始训练BERT模型...")
+for epoch in range(2):
+    train_epoch(model, train_loader, optimizer)
+    acc = evaluate(model, test_loader)
+    print(f"Epoch {epoch+1}, 准确率: {acc:.4f}")
+
+# 测试示例
+model.eval()
+test_text = "肖战演技太棒了，剧情扣人心弦"
+encoding = tokenizer.encode_plus(
+    test_text,
+    max_length=64,
+    padding='max_length',
+    truncation=True,
+    return_tensors='pt'
+)
+
+with torch.no_grad():
+    outputs = model(
+        input_ids=encoding['input_ids'].to(device),
+        attention_mask=encoding['attention_mask'].to(device)
     )
-    return completion.choices[0].message.content
-#
-# if __name__ == '__main__':
-#     print("机器学习：", text_classify_using_ml("我想看宋威龙的《骄阳似我》"))
-#     print("大模型：", text_classify_using_llm("我想看宋威龙的《骄阳似我》"))
-    text_llm = text_calssify_using_llm(input_text)
-    print("大语言模型: ", text_llm)
-    text_ml = text_calssify_using_ml(input_text)
-    print("机器学习: ", text_ml)
+    prediction = torch.argmax(outputs.logits, dim=1).item()
+
+result = '正面' if prediction == 0 else '负面'
+print(f"\n测试评论: '{test_text}'")
+print(f"BERT预测结果: {result}")
