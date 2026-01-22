@@ -329,6 +329,5 @@ def main():
     avg_time = sum(fastest_model[1]['times']) / len(fastest_model[1]['times'])
     print(f"   训练最快的模型: {fastest_model[0]} (平均每轮: {avg_time:.2f}s)")
 
-
 if __name__ == "__main__":
     main()

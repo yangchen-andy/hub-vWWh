@@ -34,7 +34,6 @@ print(f"训练集大小: {len(X_train)}")
 print(f"测试集大小: {len(X_test)}")
 print("---" * 10)
 
-
 # 2. 定义不同复杂度的神经网络模型
 class SimpleSinModel(nn.Module):
     """简单模型：1个隐藏层"""
